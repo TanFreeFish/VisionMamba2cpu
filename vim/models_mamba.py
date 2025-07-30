@@ -29,6 +29,9 @@ try:
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
+# 如果RMSNorm不可用，使用PyTorch的LayerNorm作为替代
+if RMSNorm is None:
+    from torch.nn import LayerNorm as RMSNorm
 
 __all__ = [
     'vim_tiny_patch16_224', 'vim_small_patch16_224', 'vim_base_patch16_224',
@@ -86,6 +89,13 @@ class Block(nn.Module):
         self.mixer = mixer_cls(dim)
         self.norm = norm_cls(dim)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
+        # 在纯PyTorch回退模式下禁用fused_add_norm
+        import os
+        SELECTIVE_SCAN_FORCE_FALLBACK = os.environ.get("SELECTIVE_SCAN_FORCE_FALLBACK", "FALSE").upper() == "TRUE"
+        if SELECTIVE_SCAN_FORCE_FALLBACK:
+            self.fused_add_norm = False
+        
         if self.fused_add_norm:
             assert RMSNorm is not None, "RMSNorm import fails"
             assert isinstance(
@@ -163,9 +173,24 @@ def create_block(
     factory_kwargs = {"device": device, "dtype": dtype}
     # import ipdb; ipdb.set_trace()
     mixer_cls = partial(Mamba, d_state=d_state, layer_idx=layer_idx, bimamba_type=bimamba_type, if_divide_out=if_divide_out, init_layer_scale=init_layer_scale, **ssm_cfg, **factory_kwargs)
-    norm_cls = partial(
-        nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
-    )
+    
+    # 处理纯PyTorch回退模式下的RMSNorm
+    if rms_norm and RMSNorm is None:
+        # 如果请求使用RMSNorm但不可用，则使用LayerNorm作为替代
+        norm_cls = partial(
+            nn.LayerNorm, eps=norm_epsilon, **factory_kwargs
+        )
+    else:
+        norm_cls = partial(
+            nn.LayerNorm if not rms_norm else RMSNorm, eps=norm_epsilon, **factory_kwargs
+        )
+    
+    # 在纯PyTorch回退模式下禁用fused_add_norm
+    import os
+    SELECTIVE_SCAN_FORCE_FALLBACK = os.environ.get("SELECTIVE_SCAN_FORCE_FALLBACK", "FALSE").upper() == "TRUE"
+    if SELECTIVE_SCAN_FORCE_FALLBACK:
+        fused_add_norm = False
+    
     block = Block(
         d_model,
         mixer_cls,
@@ -508,16 +533,28 @@ class VisionMamba(nn.Module):
             hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
         else:
             # Set prenorm=False here since we don't need the residual
-            fused_add_norm_fn = rms_norm_fn if isinstance(self.norm_f, RMSNorm) else layer_norm_fn
-            hidden_states = fused_add_norm_fn(
-                self.drop_path(hidden_states),
-                self.norm_f.weight,
-                self.norm_f.bias,
-                eps=self.norm_f.eps,
-                residual=residual,
-                prenorm=False,
-                residual_in_fp32=self.residual_in_fp32,
-            )
+            # 在纯PyTorch回退模式下确保使用正确的函数
+            import os
+            SELECTIVE_SCAN_FORCE_FALLBACK = os.environ.get("SELECTIVE_SCAN_FORCE_FALLBACK", "FALSE").upper() == "TRUE"
+            
+            if SELECTIVE_SCAN_FORCE_FALLBACK or rms_norm_fn is None or layer_norm_fn is None:
+                # 如果在回退模式下或函数不可用，则使用普通方法
+                if residual is None:
+                    residual = hidden_states
+                else:
+                    residual = residual + self.drop_path(hidden_states)
+                hidden_states = self.norm_f(residual.to(dtype=self.norm_f.weight.dtype))
+            else:
+                fused_add_norm_fn = rms_norm_fn if isinstance(self.norm_f, RMSNorm) else layer_norm_fn
+                hidden_states = fused_add_norm_fn(
+                    self.drop_path(hidden_states),
+                    self.norm_f.weight,
+                    self.norm_f.bias,
+                    eps=self.norm_f.eps,
+                    residual=residual,
+                    prenorm=False,
+                    residual_in_fp32=self.residual_in_fp32,
+                )
 
         # return only cls token if it exists
         if self.if_cls_token:

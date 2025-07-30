@@ -27,6 +27,22 @@ if not SELECTIVE_SCAN_FORCE_FALLBACK:
 else:
     HAS_SELECTIVE_SCAN_CUDA = False
 
+# 只在非回退模式下尝试导入triton
+if not SELECTIVE_SCAN_FORCE_FALLBACK:
+    try:
+        import triton
+        HAS_TRITON = True
+    except ImportError:
+        HAS_TRITON = False
+else:
+    HAS_TRITON = False
+
+# 只在有triton且非回退模式下导入triton相关模块
+if HAS_TRITON and not SELECTIVE_SCAN_FORCE_FALLBACK:
+    from .triton import selective_scan_triton
+else:
+    selective_scan_triton = None
+
 
 def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
                      return_last_state=False):

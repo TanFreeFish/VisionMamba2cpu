@@ -1,24 +1,42 @@
 # Copyright (c) 2023, Tri Dao, Albert Gu.
 
 import math
+import os
 from typing import Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.cuda.amp import autocast
 
 from einops import rearrange, repeat
-    
-try:
-    from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
-except ImportError:
-    causal_conv1d_fn, causal_conv1d_update = None
 
-try:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn, bimamba_inner_fn, mamba_inner_fn_no_out_proj
-except ImportError:
-    selective_scan_fn, mamba_inner_fn, bimamba_inner_fn, mamba_inner_fn_no_out_proj = None, None, None, None, None
+# 检查是否强制使用纯PyTorch实现
+SELECTIVE_SCAN_FORCE_FALLBACK = os.environ.get("SELECTIVE_SCAN_FORCE_FALLBACK", "FALSE").upper() == "TRUE"
+CAUSAL_CONV1D_FORCE_FALLBACK = os.environ.get("CAUSAL_CONV1D_FORCE_FALLBACK", "FALSE").upper() == "TRUE"
+
+# 只有在非回退模式下才尝试导入CUDA优化版本
+if not SELECTIVE_SCAN_FORCE_FALLBACK:
+    try:
+        from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn, mamba_inner_fn_no_out_proj, bimamba_inner_fn
+    except ImportError:
+        selective_scan_fn, mamba_inner_fn, mamba_inner_fn_no_out_proj, bimamba_inner_fn = None, None, None, None
+else:
+    selective_scan_fn, mamba_inner_fn, mamba_inner_fn_no_out_proj, bimamba_inner_fn = None, None, None, None
+
+if not CAUSAL_CONV1D_FORCE_FALLBACK:
+    try:
+        from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    except ImportError:
+        causal_conv1d_fn, causal_conv1d_update = None, None
+else:
+    causal_conv1d_fn, causal_conv1d_update = None, None
+
+# 只有在CUDA版本可用时才使用mamba_inner_fn系列函数
+USE_CUDA_MAMBA = (not SELECTIVE_SCAN_FORCE_FALLBACK) and mamba_inner_fn is not None
+
+from mamba_ssm.ops.selective_scan_interface import selective_scan_ref
 
 try:
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
@@ -166,10 +184,6 @@ class Mamba(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
 
     def forward(self, hidden_states, inference_params=None):
-        """
-        hidden_states: (B, L, D)
-        Returns: same shape as hidden_states
-        """
         batch, seqlen, dim = hidden_states.shape
 
         conv_state, ssm_state = None, None
@@ -190,7 +204,13 @@ class Mamba(nn.Module):
             xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
 
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
-        # In the backward pass we write dx and dz next to each other to avoid torch.cat
+        
+        # 在纯PyTorch回退模式下使用参考实现
+        if not USE_CUDA_MAMBA or SELECTIVE_SCAN_FORCE_FALLBACK:
+            # 使用纯PyTorch实现
+            return self._forward_reference(xz, A, seqlen, batch, dim, conv_state, ssm_state, inference_params)
+        
+        # CUDA优化版本
         if self.use_fast_path and inference_params is None:  # Doesn't support outputting the states
             if self.bimamba_type == "v1":
                 A_b = -torch.exp(self.A_b_log.float())
@@ -239,11 +259,8 @@ class Mamba(nn.Module):
                     delta_softplus=True,
                 )
                 # F.linear(rearrange(out_z, "b d l -> b l d"), out_proj_weight, out_proj_bias)
-                if not self.if_divide_out:
-                    out = F.linear(rearrange(out + out_b.flip([-1]), "b d l -> b l d"), self.out_proj.weight, self.out_proj.bias)
-                else:
-                    out = F.linear(rearrange(out + out_b.flip([-1]), "b d l -> b l d") / 2, self.out_proj.weight, self.out_proj.bias)
-
+                # print("F.linear(rearrange(out_z, "b d l -> b l d"), out_proj_weight, out_proj_bias)")
+                out = F.linear(rearrange(out + out_b.flip([-1]), "b d l -> b l d"), self.out_proj.weight, self.out_proj.bias)
             else:
                 out = mamba_inner_fn(
                     xz,
@@ -305,8 +322,6 @@ class Mamba(nn.Module):
                 ssm_state.copy_(last_state)
             y = rearrange(y, "b d l -> b l d")
             out = self.out_proj(y)
-        if self.init_layer_scale is not None:
-                out = out * self.gamma    
         return out
 
     def step(self, hidden_states, conv_state, ssm_state):
@@ -396,6 +411,50 @@ class Mamba(nn.Module):
                 conv_state.zero_()
                 ssm_state.zero_()
         return conv_state, ssm_state
+
+    def _forward_reference(self, xz, A, seqlen, batch, dim, conv_state, ssm_state, inference_params):
+        """纯PyTorch参考实现"""
+        x, z = xz.chunk(2, dim=1)
+        
+        # Compute short convolution
+        if conv_state is not None:
+            # If we just take x[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+            # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+            conv_state.copy_(F.pad(x, (self.d_conv - x.shape[-1], 0)))  # Update state (B D W)
+            
+        # 使用普通卷积替代causal_conv1d
+        x = self.act(self.conv1d(x)[..., :seqlen])
+
+        # We're careful here about the layout, to avoid extra transposes.
+        # We want dt to have d as the slowest moving dimension
+        # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
+        x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
+        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = self.dt_proj.weight @ dt.t()
+        dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
+        B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+        C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+        assert self.activation in ["silu", "swish"]
+        
+        # 使用参考实现的selective_scan
+        y = selective_scan_ref(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            self.D.float(),
+            z=z,
+            delta_bias=self.dt_proj.bias.float(),
+            delta_softplus=True,
+            return_last_state=ssm_state is not None,
+        )
+        if ssm_state is not None:
+            y, last_state = y
+            ssm_state.copy_(last_state)
+        y = rearrange(y, "b d l -> b l d")
+        out = self.out_proj(y)
+        return out
 
 
 class Block(nn.Module):

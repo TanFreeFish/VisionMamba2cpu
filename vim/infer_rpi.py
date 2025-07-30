@@ -71,49 +71,56 @@ def preprocess_image(image_path, input_size=224):
 def main(args):
     print("Loading model...")
     
-    # Create model
-    model = create_model(
-        args.model,
-        pretrained=False,
-        num_classes=args.num_classes,
-        drop_rate=0.0,
-        drop_path_rate=0.1,
-        drop_block_rate=None,
-    )
-    
-    # Load checkpoint if provided
-    if args.checkpoint:
-        print(f"Loading checkpoint from {args.checkpoint}")
-        checkpoint = torch.load(args.checkpoint, map_location='cpu')
-        model.load_state_dict(checkpoint['model'])
-    
-    # Move model to device
-    model.to(args.device)
-    model.eval()
-    
-    # Load ImageNet class names
-    print("Loading ImageNet class names...")
-    class_names = load_imagenet_classes()
-    
-    # Preprocess image
-    print(f"Preprocessing image from {args.image}")
-    image_tensor = preprocess_image(args.image)
-    image_tensor = image_tensor.to(args.device)
-    
-    # Perform inference
-    print("Performing inference...")
-    with torch.no_grad():
-        output = model(image_tensor)
-        probabilities = torch.nn.functional.softmax(output[0], dim=0)
-        topk_probs, topk_indices = torch.topk(probabilities, args.topk)
-    
-    # Display results
-    print("\nTop predictions:")
-    for i in range(args.topk):
-        class_idx = topk_indices[i].item()
-        prob = topk_probs[i].item()
-        class_name = class_names[class_idx] if class_idx < len(class_names) else f"Class {class_idx}"
-        print(f"{i+1}. {class_name}: {prob:.4f}")
+    try:
+        # Create model
+        model = create_model(
+            args.model,
+            pretrained=False,
+            num_classes=args.num_classes,
+            drop_rate=0.0,
+            drop_path_rate=0.1,
+            drop_block_rate=None,
+        )
+        
+        # Load checkpoint if provided
+        if args.checkpoint:
+            print(f"Loading checkpoint from {args.checkpoint}")
+            checkpoint = torch.load(args.checkpoint, map_location='cpu')
+            model.load_state_dict(checkpoint['model'])
+        
+        # Move model to device
+        model.to(args.device)
+        model.eval()
+        
+        # Load ImageNet class names
+        print("Loading ImageNet class names...")
+        class_names = load_imagenet_classes()
+        
+        # Preprocess image
+        print(f"Preprocessing image from {args.image}")
+        image_tensor = preprocess_image(args.image)
+        image_tensor = image_tensor.to(args.device)
+        
+        # Perform inference
+        print("Performing inference...")
+        with torch.no_grad():
+            output = model(image_tensor)
+            probabilities = torch.nn.functional.softmax(output[0], dim=0)
+            topk_probs, topk_indices = torch.topk(probabilities, args.topk)
+        
+        # Display results
+        print("\nTop predictions:")
+        for i in range(args.topk):
+            class_idx = topk_indices[i].item()
+            prob = topk_probs[i].item()
+            class_name = class_names[class_idx] if class_idx < len(class_names) else f"Class {class_idx}"
+            print(f"{i+1}. {class_name}: {prob:.4f}")
+            
+    except Exception as e:
+        print(f"Error occurred: {e}")
+        print("\nPlease make sure you have set the environment variables:")
+        print("export CAUSAL_CONV1D_FORCE_FALLBACK=TRUE")
+        print("export SELECTIVE_SCAN_FORCE_FALLBACK=TRUE")
 
 if __name__ == '__main__':
     parser = get_args_parser()
