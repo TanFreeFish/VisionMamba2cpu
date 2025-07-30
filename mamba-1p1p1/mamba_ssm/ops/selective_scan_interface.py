@@ -3,8 +3,12 @@
 import torch
 import torch.nn.functional as F
 from torch.cuda.amp import custom_bwd, custom_fwd
+import os
 
 from einops import rearrange, repeat
+
+# 检查是否强制使用纯PyTorch实现
+SELECTIVE_SCAN_FORCE_FALLBACK = os.environ.get("SELECTIVE_SCAN_FORCE_FALLBACK", "FALSE").upper() == "TRUE"
 
 try:
     from causal_conv1d import causal_conv1d_fn
@@ -13,7 +17,29 @@ except ImportError:
     causal_conv1d_fn = None
     causal_conv1d_cuda = None
 
-import selective_scan_cuda
+# 尝试导入CUDA版本
+if not SELECTIVE_SCAN_FORCE_FALLBACK:
+    try:
+        import selective_scan_cuda
+        HAS_SELECTIVE_SCAN_CUDA = True
+    except ImportError:
+        HAS_SELECTIVE_SCAN_CUDA = False
+else:
+    HAS_SELECTIVE_SCAN_CUDA = False
+
+
+def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
+                     return_last_state=False):
+    """if return_last_state is True, returns (out, last_state)
+    last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
+    not considered in the backward pass.
+    """
+    # 如果不能使用CUDA版本，则使用纯PyTorch实现
+    if not HAS_SELECTIVE_SCAN_CUDA:
+        return selective_scan_ref(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
+    
+    # 否则使用CUDA实现
+    return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
 
 
 class SelectiveScanFn(torch.autograd.Function):
@@ -21,6 +47,10 @@ class SelectiveScanFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
                 return_last_state=False):
+        if not HAS_SELECTIVE_SCAN_CUDA:
+            # 如果没有CUDA支持，抛出异常
+            raise RuntimeError("SelectiveScanFn requires CUDA support but it's not available")
+            
         if u.stride(-1) != 1:
             u = u.contiguous()
         if delta.stride(-1) != 1:
@@ -53,6 +83,10 @@ class SelectiveScanFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        if not HAS_SELECTIVE_SCAN_CUDA:
+            # 如果没有CUDA支持，抛出异常
+            raise RuntimeError("SelectiveScanFn requires CUDA support but it's not available")
+            
         if not ctx.has_z:
             u, delta, A, B, C, D, delta_bias, x = ctx.saved_tensors
             z = None
@@ -77,15 +111,6 @@ class SelectiveScanFn(torch.autograd.Function):
                 ddelta_bias if delta_bias is not None else None,
                 None,
                 None)
-
-
-def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
-                     return_last_state=False):
-    """if return_last_state is True, returns (out, last_state)
-    last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
-    not considered in the backward pass.
-    """
-    return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
 
 
 def selective_scan_ref(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
@@ -167,6 +192,10 @@ class MambaInnerFnNoOutProj(torch.autograd.Function):
         """
              xz: (batch, dim, seqlen)
         """
+        # 如果没有CUDA支持，抛出异常
+        if not HAS_SELECTIVE_SCAN_CUDA:
+            raise RuntimeError("MambaInnerFnNoOutProj requires CUDA support but it's not available")
+        
         assert checkpoint_lvl in [0, 1]
         L = xz.shape[-1]
         delta_rank = delta_proj_weight.shape[1]
@@ -199,10 +228,9 @@ class MambaInnerFnNoOutProj(torch.autograd.Function):
             else:
                 B = rearrange(B, "(b l) (dstate two) -> b 1 dstate (l two)", l=L, two=2).contiguous()
         else:
-            if B.stride(-1) != 1:
-                B = B.contiguous()
+            B = B.contiguous()
         if C is None:  # variable C
-            C = x_dbl[:, -d_state:]  # (bl dstate)
+            C = x_dbl[:, -d_state:]  # (bl d)
             if C_proj_bias is not None:
                 C = C + C_proj_bias.to(dtype=C.dtype)
             if not A.is_complex():
@@ -211,27 +239,29 @@ class MambaInnerFnNoOutProj(torch.autograd.Function):
             else:
                 C = rearrange(C, "(b l) (dstate two) -> b 1 dstate (l two)", l=L, two=2).contiguous()
         else:
-            if C.stride(-1) != 1:
-                C = C.contiguous()
+            C = C.contiguous()
         if D is not None:
             D = D.contiguous()
         out, scan_intermediates, out_z = selective_scan_cuda.fwd(
-            conv1d_out, delta, A, B, C, D, z, delta_bias, delta_softplus
+            conv1d_out, delta, A, B, C, D, z, delta_bias, delta_softplus,
+            True  # return softmax_BdC
         )
         ctx.delta_softplus = delta_softplus
         ctx.checkpoint_lvl = checkpoint_lvl
         if checkpoint_lvl >= 1:  # Will recompute conv1d_out and delta in the backward pass
             conv1d_out, delta = None, None
         ctx.save_for_backward(xz, conv1d_weight, conv1d_bias, x_dbl, x_proj_weight,
-                              delta_proj_weight, conv1d_out, delta,
-                              A, B, C, D, delta_bias, scan_intermediates, out)
-        # return rearrange(out_z, "b d l -> b l d")
-        return out_z
+                              delta_proj_weight, out_z, A, B, C, D, delta_bias,
+                              scan_intermediates, conv1d_out, delta)
+        return out
 
     @staticmethod
     @custom_bwd
     def backward(ctx, dout):
-        # dout: (batch, seqlen, dim)
+        # 如果没有CUDA支持，抛出异常
+        if not HAS_SELECTIVE_SCAN_CUDA:
+            raise RuntimeError("MambaInnerFnNoOutProj requires CUDA support but it's not available")
+            
         (xz, conv1d_weight, conv1d_bias, x_dbl, x_proj_weight, delta_proj_weight, 
          conv1d_out, delta, A, B, C, D, delta_bias, scan_intermediates, out) = ctx.saved_tensors
         L = xz.shape[-1]

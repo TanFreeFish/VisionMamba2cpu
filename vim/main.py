@@ -7,6 +7,7 @@ import time
 import torch
 import torch.backends.cudnn as cudnn
 import json
+import os
 
 from pathlib import Path
 
@@ -32,6 +33,15 @@ import utils
 # log about
 import mlflow
 
+# 设置环境变量以强制使用纯PyTorch实现（针对树莓派）
+CAUSAL_CONV1D_FORCE_FALLBACK = os.environ.get("CAUSAL_CONV1D_FORCE_FALLBACK", "FALSE").upper() == "TRUE"
+SELECTIVE_SCAN_FORCE_FALLBACK = os.environ.get("SELECTIVE_SCAN_FORCE_FALLBACK", "FALSE").upper() == "TRUE"
+
+if CAUSAL_CONV1D_FORCE_FALLBACK:
+    print("Using pure PyTorch implementation for causal_conv1d")
+    
+if SELECTIVE_SCAN_FORCE_FALLBACK:
+    print("Using pure PyTorch implementation for selective_scan")
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DeiT training and evaluation script', add_help=False)
